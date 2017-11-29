@@ -1,0 +1,5 @@
+/App
+#.gitignore
+*.d
+*.o
+readme.txt
