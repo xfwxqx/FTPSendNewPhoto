@@ -41,7 +41,7 @@ extern "C" {
 
 
 
-typedef struct __attribute__((packed)) _FTP_SENDFILE_CONFIG
+typedef struct _FTP_SENDFILE_CONFIG
 {
 	U8		UserName[FTP_SENDFILE_STRING_LEN_MAX];
 	U8		PassWord[FTP_SENDFILE_STRING_LEN_MAX];

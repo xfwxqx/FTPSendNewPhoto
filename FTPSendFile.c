@@ -35,7 +35,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "sqlite3.h"
-
+#include <signal.h>
+#include <assert.h>
 
 //#include "ConfigServer.h"
 
@@ -47,8 +48,8 @@
 
 #define DEBUG
 
-#define FTP_SENDFILE_FILE_NAME_LENGTH_MAX		50			//文件名最大字节长度
-#define FTP_SENDFILE_QUEUE_NODE_MAX				100		//队列中缓存的文件个数最大值
+//#define FTP_SENDFILE_FILE_NAME_LENGTH_MAX		50			//文件名最大字节长度
+//#define FTP_SENDFILE_QUEUE_NODE_MAX				100		//队列中缓存的文件个数最大值
 #define FTP_SENDFILE_WORKTHREAD_TIME_SLICE_US 	50*1000
 
 #define FTP_SENDFILE_SERVER_IP_DEFAULT		"192.168.1.90"
@@ -60,7 +61,7 @@
 
 #define FTP_SENDFILE_WORK_DIR_DEFAULT		"/dvs/srv/ftp/PIC"
 #define FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S	10
-#define FTP_SENDFILE_QUEUE_DATABUF_MAX		1024
+#define FTP_SENDFILE_QUEUE_DATABUF_MAX		150
 #define FTP_SENDFILE_LOG_FILE		"/tmp/log.txt"
 #define FTP_SENDFILE_SYSTEM_CALLER_TIMEOUT			30
 
@@ -92,13 +93,17 @@ typedef struct __attribute__((packed)) _FTP_SENDFILE_QUEUE_DATA
 	U8  	DataBuf[FTP_SENDFILE_QUEUE_DATABUF_MAX];
 }FTP_SENDFILE_QUEUE_DATA,*PFTP_SENDFILE_QUEUE_DATA;
 
-typedef struct __attribute__((packed)) _FTP_SENDFILE_QUEUE
-{
-	U32 	Head;
-	U32 	Tail;
-	U32 	OverCount;
-	FTP_SENDFILE_QUEUE_DATA Queue[FTP_SENDFILE_QUEUE_NODE_MAX];
+typedef struct __attribute__((packed)) _FTP_SENDFILE_QUEUE_NODE{	
+	struct _FTP_SENDFILE_QUEUE_NODE *Next;	
+	FTP_SENDFILE_QUEUE_DATA Data;
+}FTP_SENDFILE_QUEUE_NODE;
+
+typedef struct{	
+	FTP_SENDFILE_QUEUE_NODE *Head;	
+	FTP_SENDFILE_QUEUE_NODE *Tail;	
+	//U32 Count;
 }FTP_SENDFILE_QUEUE,*PFTP_SENDFILE_QUEUE;
+
 
 typedef struct _FTP_SENDFILE_ACK
 {
@@ -122,7 +127,7 @@ typedef struct _FTP_SENDFILE_SQLITE_MSG
 }FTP_SENDFILE_SQLITE_MSG,*PFTP_SENDFILE_SQLITE_MSG;
 
 
-typedef struct __attribute__((packed)) _FTP_SENDFILE_SERVER
+typedef struct _FTP_SENDFILE_SERVER
 {
 	U8 						IsOpen;  													/*模块是否打开*/
 	
@@ -131,12 +136,17 @@ typedef struct __attribute__((packed)) _FTP_SENDFILE_SERVER
 	pthread_t				FTPWorkThreadPID;											/*FTP上传文件工作线程所在进程号*/
 	U8 						IsFTPWorkThreadReqQuit;										/*线程请求退出标志*/							
 	FTP_SENDFILE_CONFIG 	FtpConfig;														/*配置*/	
-	FTP_SENDFILE_QUEUE		SendFileQueue;
+	//FTP_SENDFILE_QUEUE		SendFileQueue;
 	U32						MainWorkThreadRunCount;
 	U32						FTPWorkThreadRunCount;
 	FTP_SENDFILE_ACK 		FtpSendFileAck;
 	U32						MainWorkThreadLastCheckFileTime;			//最后一次检查文件时间，用于比对当前是否需要检查文件
 	U32						FTPWorkThreadLastRunTime;					//FTP上传文件工作线程最后一次运行时间，用于检测线程是否被阻塞
+	FTP_SENDFILE_QUEUE 		*pQueue;
+	U8 						IsMainWorkThreadQuit;
+	U8 						IsFTPWorkThreadQuit;
+	U32						FTPSendFailCnt;
+	U32						FTPSendFailCntContinuous;
 	//FTP_SENDFILE_SQLITE_MSG RecordMsg;
 }FTP_SENDFILE_SERVER, *PFTP_SENDFILE_SERVER;
 
@@ -191,25 +201,64 @@ extern DWORD ConfigServerGetSysRunTime(BOOL IsInMs)
  *特殊说明: 无
  ************************************************************************************************************************************************************************       
  */
-static U8 FTP_SENDFILE_QueuePush(FTP_SENDFILE_QUEUE_HANDLE Handle,PFTP_SENDFILE_QUEUE_DATA pReq)
-{
-	int  OldStatus;
-	PFTP_SENDFILE_QUEUE pQueue = (PFTP_SENDFILE_QUEUE)Handle;
 
-	if((NULL == pQueue)||(NULL == pReq))
-		return FALSE;
-	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileMutex, OldStatus);
-	if(((pQueue->Head+1)%FTP_SENDFILE_QUEUE_NODE_MAX) == pQueue->Tail)
-	{
-		JSYA_Printf("缓存文件名超过限制%u\n\r",FTP_SENDFILE_QUEUE_NODE_MAX);
-		pQueue->OverCount++;
-		PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
-		return FALSE;
+static U32 FTP_SENDFILE_QueueListInit(FTP_SENDFILE_QUEUE **Queue)
+{	
+	FTP_SENDFILE_QUEUE *pTemp=NULL;	
+	pTemp = (FTP_SENDFILE_QUEUE *)malloc(sizeof(FTP_SENDFILE_QUEUE));	
+	if(pTemp==NULL){	
+		fprintf(stderr,"%s ERROR:%s\n",__FUNCTION__,strerror(errno));
+		return FALSE;	
+	}	
+	memset(pTemp,0,sizeof(FTP_SENDFILE_QUEUE));	
+	*Queue = pTemp;	
+	return TRUE;
+}
+
+static void FTP_SENDFILE_QueueListDeInit(FTP_SENDFILE_QUEUE **ppQueue)
+{	
+	FTP_SENDFILE_QUEUE_NODE *pTempHead=NULL;	
+	FTP_SENDFILE_QUEUE_NODE *pTemp=NULL;	
+	FTP_SENDFILE_QUEUE *pQueue=NULL;		
+
+	DPrintf("@@@@@@@@@@ 准备释放队列所占用的空间...\r\n");
+	if(*ppQueue!=NULL){		
+		pQueue = *ppQueue;		
+		pTempHead = pQueue->Head;		
+		while(pTempHead!=NULL){			
+			pTemp = pTempHead->Next;			
+			free(pTempHead);			
+			pTempHead = pTemp;		
+		}		
+		free(pQueue);		
+		*ppQueue = NULL;	
 	}
-	pQueue->Queue[pQueue->Head] = *pReq;
-	pQueue->Head = (pQueue->Head+1)%FTP_SENDFILE_QUEUE_NODE_MAX;
-	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
+}
+
+static U32 FTP_SENDFILE_QueuePush(FTP_SENDFILE_QUEUE *pQueue,PFTP_SENDFILE_QUEUE_DATA pReq)
+{	
+	FTP_SENDFILE_QUEUE_NODE *pNewNode=NULL;	
+	int OldStatus;
 	
+	if((pQueue==NULL)||(pReq==NULL))		
+		return FALSE;	
+	
+	pNewNode = (FTP_SENDFILE_QUEUE_NODE *)malloc(sizeof(FTP_SENDFILE_QUEUE_NODE));	
+	if(pNewNode==NULL){		
+		fprintf(stderr,"%s ERROR:%s\n",__FUNCTION__,strerror(errno));
+		return FALSE;	
+	}	
+	
+	memset(pNewNode,0,sizeof(FTP_SENDFILE_QUEUE_NODE));	
+	memcpy(&pNewNode->Data,pReq,sizeof(FTP_SENDFILE_QUEUE_DATA));	
+	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileMutex, OldStatus);
+	if((pQueue->Head==NULL) && (pQueue->Tail==NULL)){		
+		pQueue->Head = pQueue->Tail = pNewNode;	
+	}else{		
+		pQueue->Tail->Next = pNewNode;		
+		pQueue->Tail = pNewNode;	
+	}
+	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
 	return TRUE;
 }
 
@@ -225,43 +274,38 @@ static U8 FTP_SENDFILE_QueuePush(FTP_SENDFILE_QUEUE_HANDLE Handle,PFTP_SENDFILE_
  *特殊说明: 
  ************************************************************************************************************************************************************************       
  */
-static U8 FTP_SENDFILE_QueuePop(FTP_SENDFILE_QUEUE_HANDLE Handle,PFTP_SENDFILE_QUEUE_DATA pReq)
-{
-	int  OldStatus;
-	PFTP_SENDFILE_QUEUE pQueue = (PFTP_SENDFILE_QUEUE)Handle;
-
-	if((NULL == pQueue)||(NULL == pReq))
-		return FALSE;
-	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileMutex, OldStatus);
-	if(pQueue->Tail == pQueue->Head)
-	{
-		PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
-		return FALSE;
-	}
-	*pReq = pQueue->Queue[pQueue->Tail];
-	pQueue->Tail = (pQueue->Tail+1)%FTP_SENDFILE_QUEUE_NODE_MAX;
-	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
+static U32 FTP_SENDFILE_QueueGetHead(FTP_SENDFILE_QUEUE *pQueue)
+{	
+	if((pQueue==NULL)||(pQueue->Head==NULL))		
+		return FALSE;	
 	
 	return TRUE;
 }
-/*判断队列是否为空*/
-static U32 FTP_SENDFILE_QueueGetHead(FTP_SENDFILE_QUEUE_HANDLE Handle)
-{
-	int  OldStatus;
-	PFTP_SENDFILE_QUEUE pQueue = (PFTP_SENDFILE_QUEUE)Handle;
 
-	if(NULL == pQueue)
-		return FALSE;
-	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileMutex, OldStatus);
-	if(pQueue->Tail == pQueue->Head)
-	{
-		PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
-		return TRUE;
-	}
-	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
+static U32 FTP_SENDFILE_QueuePop(FTP_SENDFILE_QUEUE *pQueue,PFTP_SENDFILE_QUEUE_DATA pReq)
+{	
+	FTP_SENDFILE_QUEUE_NODE *pDelNode=NULL; 
+	int OldStatus;
 	
-	return FALSE;
+	if((pQueue==NULL)||(pQueue->Head==NULL))		
+		return FALSE;	
+	
+	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileMutex, OldStatus);
+	pDelNode = pQueue->Head;		
+	if(pReq!=NULL)		
+		memcpy(pReq,&pDelNode->Data,sizeof(FTP_SENDFILE_QUEUE_DATA));	
+	
+	if(pQueue->Head==pQueue->Tail){ 	
+		pQueue->Head = pQueue->Tail = NULL; 
+	}else{		
+		pQueue->Head = pDelNode->Next;	
+	}		
+	free(pDelNode); 
+	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileMutex, OldStatus);
+	return TRUE;
 }
+
+
 static void InitParam(PFTP_SENDFILE_CONFIG pConfig,PFTP_SENDFILE_CONFIG pTempConfig)
 {
 	if((pConfig==NULL)||(pTempConfig==NULL))
@@ -419,8 +463,7 @@ static U32 FTP_SENDFILE_RecordMsg_Make(PFTP_SENDFILE_SQLITE_MSG pMsg,U8 *pFileNa
 	return TRUE;
 }
 
-
-static U32 FTP_SENDFILE_Insert_FileName(PFTP_SENDFILE_SQLITE_MSG pMsg)
+static U32 FTP_SENDFILE_CreatConfigTable(char *pDB)
 {
 	sqlite3 *		DBHandle=NULL;
 	int				nrow=0,ncolumn=0;
@@ -430,16 +473,23 @@ static U32 FTP_SENDFILE_Insert_FileName(PFTP_SENDFILE_SQLITE_MSG pMsg)
 	char			sql[4096]={0};
 	char			Utf8Sql[8192]={0};
 
-	if(pMsg==NULL)
-		return FALSE;
-    rc=sqlite3_open(FTP_SENDFILE_DB_PATH,&DBHandle);
+    rc=sqlite3_open(pDB,&DBHandle);
     if(rc!=SQLITE_OK)
 	{
 		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
         sqlite3_close(DBHandle);
 		return FALSE;
     }
-	snprintf(sql,sizeof(sql)-1,"INSERT INTO SentFileTable VALUES('%s','%s');",pMsg->FileName,pMsg->SendTime);
+	snprintf(sql,sizeof(sql)-1,\
+		"CREATE TABLE config("\
+			"UserName TEXT DEFAULT 'fsuUser',"\
+			"Password TEXT DEFAULT 'yaao@abc#123',"\
+			"ServerIP TEXT NOT NULL DEFAULT '10.2.0.1',"\
+			"Port INTEGER NOT NULL DEFAULT 21,"\
+			"WorkDirectory TEXT NOT NULL DEFAULT '/dvs/srv/ftp/PIC',"\
+			"MaxRcdPerMonth INTEGER NOT NULL DEFAULT 1500,"\
+			"AlreadyUploadedCnt INTEGER NOT NULL DEFAULT 0);"\
+			);
 	Len=sizeof(Utf8Sql);
 	rc=sqlite3_busy_timeout(DBHandle,FTP_SENDFILE_DB_BUSY_TIMEOUT_MS);
 	if(PublicUtf8StrEncode(sql,Utf8Sql,&Len))
@@ -460,7 +510,85 @@ static U32 FTP_SENDFILE_Insert_FileName(PFTP_SENDFILE_SQLITE_MSG pMsg)
     return rc==SQLITE_OK?TRUE:FALSE;
 }
 
-static U32 FTP_SENDFILE_Select_FileName(PFTP_SENDFILE_SQLITE_MSG pMsg)
+static U32 FTP_SENDFILE_CreatSentFileTable(char *pDB)
+{
+	sqlite3 *		DBHandle=NULL;
+	int				nrow=0,ncolumn=0;
+	char **			azResult;
+	char *			zErrMsg=NULL;
+	int				rc,Len;
+	char			sql[4096]={0};
+	char			Utf8Sql[8192]={0};
+
+    rc=sqlite3_open(pDB,&DBHandle);
+    if(rc!=SQLITE_OK)
+	{
+		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
+        sqlite3_close(DBHandle);
+		return FALSE;
+    }
+	snprintf(sql,sizeof(sql)-1,"CREATE TABLE SentFileTable(NodeID INTEGER PRIMARY KEY AUTOINCREMENT,FileName VARCHAR(40),SendTime VARCHAR(20));");
+	Len=sizeof(Utf8Sql);
+	rc=sqlite3_busy_timeout(DBHandle,FTP_SENDFILE_DB_BUSY_TIMEOUT_MS);
+	if(PublicUtf8StrEncode(sql,Utf8Sql,&Len))
+		rc=sqlite3_exec(DBHandle,Utf8Sql,NULL,NULL,&zErrMsg);
+	else
+		rc=sqlite3_exec(DBHandle,sql,NULL,NULL,&zErrMsg);
+	if(rc!=SQLITE_OK)
+	{
+		if(zErrMsg)
+		{
+			JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,zErrMsg);
+			sqlite3_free(zErrMsg);
+			zErrMsg=NULL;
+		}
+	}
+	
+    sqlite3_close(DBHandle);               
+    return rc==SQLITE_OK?TRUE:FALSE;
+}
+
+static U32 FTP_SENDFILE_Insert_FileName(char *pDB,PFTP_SENDFILE_SQLITE_MSG pMsg)
+{
+	sqlite3 *		DBHandle=NULL;
+	int				nrow=0,ncolumn=0;
+	char **			azResult;
+	char *			zErrMsg=NULL;
+	int				rc,Len;
+	char			sql[4096]={0};
+	char			Utf8Sql[8192]={0};
+
+	if((pMsg==NULL)||(pDB==NULL))
+		return FALSE;
+    rc=sqlite3_open(pDB,&DBHandle);
+    if(rc!=SQLITE_OK)
+	{
+		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
+        sqlite3_close(DBHandle);
+		return FALSE;
+    }
+	snprintf(sql,sizeof(sql)-1,"INSERT INTO SentFileTable VALUES(NULL,'%s','%s');",pMsg->FileName,pMsg->SendTime);
+	Len=sizeof(Utf8Sql);
+	rc=sqlite3_busy_timeout(DBHandle,FTP_SENDFILE_DB_BUSY_TIMEOUT_MS);
+	if(PublicUtf8StrEncode(sql,Utf8Sql,&Len))
+		rc=sqlite3_exec(DBHandle,Utf8Sql,NULL,NULL,&zErrMsg);
+	else
+		rc=sqlite3_exec(DBHandle,sql,NULL,NULL,&zErrMsg);
+	if(rc!=SQLITE_OK)
+	{
+		if(zErrMsg)
+		{
+			JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,zErrMsg);
+			sqlite3_free(zErrMsg);
+			zErrMsg=NULL;
+		}
+	}
+	
+    sqlite3_close(DBHandle);               
+    return rc==SQLITE_OK?TRUE:FALSE;
+}
+
+static U32 FTP_SENDFILE_Select_FileName(char *pDB,PFTP_SENDFILE_SQLITE_MSG pMsg)
 {
 	sqlite3 *		DBHandle=NULL;
 	int				nrow=0,ncolumn=0;
@@ -470,9 +598,9 @@ static U32 FTP_SENDFILE_Select_FileName(PFTP_SENDFILE_SQLITE_MSG pMsg)
 	char			SqlBuf[4096]={0};
 	char			Utf8Sql[8192]={0};
 
-	if(pMsg==NULL)
+	if((pMsg==NULL)||(pDB==NULL))
 		return FALSE;
-    rc=sqlite3_open(FTP_SENDFILE_DB_PATH,&DBHandle);
+    rc=sqlite3_open(pDB,&DBHandle);
     if(rc!=SQLITE_OK)
 	{
 		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
@@ -541,7 +669,7 @@ static void Getsqlitechar(char *dst,char *azResult,size_t dwLen)
 }
 
 
-static U32 FTP_SENDFILE_GetParamFromDB(PFTP_SENDFILE_CONFIG pConfig)
+static U32 FTP_SENDFILE_GetParamFromDB(char *pDB,PFTP_SENDFILE_CONFIG pConfig)
 {
 	sqlite3 *		DBHandle=NULL;
 	int				nrow=0,ncolumn=0;
@@ -551,9 +679,9 @@ static U32 FTP_SENDFILE_GetParamFromDB(PFTP_SENDFILE_CONFIG pConfig)
 	char			SqlBuf[4096]={0};
 	char			Utf8Sql[8192]={0};
 
-	if(pConfig==NULL)
+	if((pConfig==NULL)||(pDB==NULL))
 		return FALSE;
-    rc=sqlite3_open(FTP_SENDFILE_DB_PATH,&DBHandle);
+    rc=sqlite3_open(pDB,&DBHandle);
     if(rc!=SQLITE_OK)
 	{
 		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
@@ -596,10 +724,10 @@ static U32 FTP_SENDFILE_GetParamFromDB(PFTP_SENDFILE_CONFIG pConfig)
 
 }
 
-#define FTP_SENDFILE_UPDATE_ALREADY_UPLOADED_CNT 0
-#define FTP_SENDFILE_UPDATE_MAX_RECORD_PER_MONTH 1
+#define FTP_SENDFILE_UPDATE_ALREADY_UPLOADED_CNT 	1
+#define FTP_SENDFILE_UPDATE_MAX_RECORD_PER_MONTH	2
 
-static U32 FTP_SENDFILE_UPDATE(U32 Param,U32 Value)
+static U32 FTP_SENDFILE_UPDATE(char *pDB,U32 Param,void *pValue)
 {
 	sqlite3 *		DBHandle=NULL;
 	int				nrow=0,ncolumn=0;
@@ -608,8 +736,12 @@ static U32 FTP_SENDFILE_UPDATE(U32 Param,U32 Value)
 	int				rc,Len;
 	char			SqlBuf[4096]={0};
 	char			Utf8Sql[8192]={0};
-
-    rc=sqlite3_open(FTP_SENDFILE_DB_PATH,&DBHandle);
+	PFTP_SENDFILE_CONFIG pConfig=pValue;
+	
+	if(pDB==NULL)
+		return FALSE;
+	
+    rc=sqlite3_open(pDB,&DBHandle);
     if(rc!=SQLITE_OK)
 	{
 		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
@@ -618,8 +750,9 @@ static U32 FTP_SENDFILE_UPDATE(U32 Param,U32 Value)
     }
 	switch(Param)
 	{
+		
 		case FTP_SENDFILE_UPDATE_ALREADY_UPLOADED_CNT:
-			snprintf(SqlBuf,sizeof(SqlBuf)-1,"UPDATE config SET AlreadyUploadedCnt=%u;",Value);
+			snprintf(SqlBuf,sizeof(SqlBuf)-1,"UPDATE config SET AlreadyUploadedCnt=%u;",*(U32 *)pValue);
 			break;
 		default:
 			sqlite3_close(DBHandle);
@@ -641,12 +774,79 @@ static U32 FTP_SENDFILE_UPDATE(U32 Param,U32 Value)
 			zErrMsg=NULL;
 		}
 	}
-	
+	JSYA_Printf("SQLITE: %s:%s\r\n",__FUNCTION__,Utf8Sql);
     sqlite3_close(DBHandle);         
 	return rc==SQLITE_OK?TRUE:FALSE;
 }
 
-#define FTP_SENDFILE_SaveUploadedCnt(value) FTP_SENDFILE_UPDATE(FTP_SENDFILE_UPDATE_ALREADY_UPLOADED_CNT,value)
+#define FTP_SENDFILE_SaveUploadedCnt(pValue) FTP_SENDFILE_UPDATE(FTP_SENDFILE_DB_PATH,FTP_SENDFILE_UPDATE_ALREADY_UPLOADED_CNT,(void *)pValue)
+
+
+
+static U32 FTP_SENDFILE_SetParamToDB(char *pDB,void *pValue)
+{
+	sqlite3 *		DBHandle=NULL;
+	int				nrow=0,ncolumn=0;
+	char **			azResult;
+	char *			zErrMsg=NULL;
+	int				rc,Len;
+	char			SqlBuf[4096]={0};
+	char			Utf8Sql[8192]={0};
+	PFTP_SENDFILE_CONFIG pConfig=pValue;
+	
+	if(pDB==NULL)
+		return FALSE;
+	
+    rc=sqlite3_open(pDB,&DBHandle);
+    if(rc!=SQLITE_OK)
+	{
+		JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,sqlite3_errstr(rc));
+        sqlite3_close(DBHandle);
+		return FALSE;
+    }
+	strcpy(Utf8Sql,"DELETE FROM config;");
+	rc=sqlite3_busy_timeout(DBHandle,FTP_SENDFILE_DB_BUSY_TIMEOUT_MS);
+	rc=sqlite3_exec(DBHandle,Utf8Sql,NULL,NULL,&zErrMsg);
+	JSYA_Printf("SQLITE: %s:%s\r\n",__FUNCTION__,Utf8Sql);
+	if(rc!=SQLITE_OK)
+	{
+		if(zErrMsg)
+		{
+			JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,zErrMsg);
+			sqlite3_free(zErrMsg);
+			zErrMsg=NULL;
+    		sqlite3_close(DBHandle);         
+			return rc==SQLITE_OK?TRUE:FALSE;
+		}
+	}
+	
+	snprintf(SqlBuf,sizeof(SqlBuf)-1,\
+		"INSERT INTO config "\
+		"(UserName,Password,ServerIP,Port,WorkDirectory,MaxRcdPerMonth,AlreadyUploadedCnt) "\
+		"VALUES ('%s','%s','%s',%u,'%s',%u,%u);",\
+		pConfig->UserName,pConfig->PassWord,pConfig->FtpServerIP,pConfig->Port,\
+		pConfig->WorkDirectory,pConfig->MaxRecordPerMonth,pConfig->UploadedCnt);
+	
+	Len=sizeof(Utf8Sql);
+	rc=sqlite3_busy_timeout(DBHandle,FTP_SENDFILE_DB_BUSY_TIMEOUT_MS);
+	if(PublicUtf8StrEncode(SqlBuf,Utf8Sql,&Len))
+		rc=sqlite3_exec(DBHandle,Utf8Sql,NULL,NULL,&zErrMsg);
+	else
+		rc=sqlite3_exec(DBHandle,SqlBuf,NULL,NULL,&zErrMsg);
+	if(rc!=SQLITE_OK)
+	{
+		if(zErrMsg)
+		{
+			JSYA_Printf("SQLITE: %s:%s...\r\n",__FUNCTION__,zErrMsg);
+			sqlite3_free(zErrMsg);
+			zErrMsg=NULL;
+		}
+	}
+	JSYA_Printf("SQLITE: %s:%s\r\n",__FUNCTION__,Utf8Sql);
+    sqlite3_close(DBHandle);         
+	return rc==SQLITE_OK?TRUE:FALSE;
+}
+
 /*
  ************************************************************************************************************************************************************************     
  *函数名称: 
@@ -663,7 +863,7 @@ static void *MainWorkProcess(void *pArg)
 {
 
 	FTP_SENDFILE_QUEUE_DATA QueueData;
-	U32	CurrentTime;
+
 	DIR *dir;
 	struct dirent *pDir;
 	struct stat FileStat; 
@@ -676,26 +876,35 @@ static void *MainWorkProcess(void *pArg)
 
 	for(; ;)
 	{
-		if(gFtpSendFileServer.IsMainWorkThreadReqQuit)
+		gFtpSendFileServer.IsMainWorkThreadQuit = FALSE;
+		
+		if(gFtpSendFileServer.IsMainWorkThreadReqQuit==TRUE)
 		{
+			DPrintf("gFtpSendFileServer.IsMainWorkThreadReqQuit is TRUE\n");
 			gFtpSendFileServer.IsMainWorkThreadReqQuit = FALSE;
+			DPrintf("gFtpSendFileServer.IsMainWorkThreadReqQuit is TRUE,Then set false\n");
 			break;
 		}
 		pthread_testcancel();
+		usleep(50*1000);
 		gFtpSendFileServer.MainWorkThreadLastCheckFileTime = time(NULL);
 		
 		for(; ;)
 		{
-			if(gFtpSendFileServer.IsMainWorkThreadReqQuit)
-				break;
-			pthread_testcancel();
+			gFtpSendFileServer.IsMainWorkThreadQuit = FALSE;
 			
-			GET_CURRENT_SYS_TIME(CurrentTime);
+			if(gFtpSendFileServer.IsMainWorkThreadReqQuit==TRUE){
+				DPrintf("gFtpSendFileServer.IsMainWorkThreadReqQuit is TRUE\n");
+				break;
+			}
+			pthread_testcancel();
+			usleep(50*1000);
+			
 			if((gFtpSendFileServer.MainWorkThreadRunCount%1000)== 0)
 				JSYA_Printf("主工作线程(PID=%d 线程号:%u RunCount:%u)正在运行...\r\n",getpid(),pthread_self(),gFtpSendFileServer.MainWorkThreadRunCount);
 
 			//定时检测文件
-			if(((time(NULL)-gFtpSendFileServer.MainWorkThreadLastCheckFileTime)>FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S)
+			if(((time(NULL)-gFtpSendFileServer.MainWorkThreadLastCheckFileTime)>=FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S)
 				&&(gFtpSendFileServer.FtpConfig.UploadedCnt<gFtpSendFileServer.FtpConfig.MaxRecordPerMonth))
 			{
 				gFtpSendFileServer.MainWorkThreadLastCheckFileTime = time(NULL);
@@ -724,14 +933,15 @@ static void *MainWorkProcess(void *pArg)
 								JSYA_Printf("stat(%s) error:(%s)\n\r",FileNameTemp,strerror(errno));
 								continue;
 							}
-							if((time(NULL)-FileStat.st_mtime)<(FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S+1))
+							if((gFtpSendFileServer.MainWorkThreadLastCheckFileTime - FileStat.st_mtime)<=(FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S+1))
 							{
-								JSYA_Printf("主工作线程发现有新修改文件(%s),当前时间(%u),上次修改时间(%u)\n\r",FileNameTemp,time(NULL),FileStat.st_mtime);
+								JSYA_Printf("主工作线程发现有新修改文件(%s),当前检测开始时间(%u),上次修改时间(%u)\n\r",\
+									FileNameTemp,gFtpSendFileServer.MainWorkThreadLastCheckFileTime,FileStat.st_mtime);
 								memset(&RecordMsg,0,sizeof(FTP_SENDFILE_SQLITE_MSG));
 								if(FALSE == FTP_SENDFILE_RecordMsg_Make(&RecordMsg,FileNameTemp))
 									continue; 
 								PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
-								if(FTP_SENDFILE_Select_FileName(&RecordMsg)
+								if(FTP_SENDFILE_Select_FileName(FTP_SENDFILE_DB_PATH,&RecordMsg)
 									&&(RecordMsg.Ret == RET_ENUM_SUCCESS))//检查该文件是否上传成功(比对数据库)
 								{
 									PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);
@@ -744,8 +954,13 @@ static void *MainWorkProcess(void *pArg)
 									memset(&SendFileName,'\0',sizeof(SendFileName));	
 									SendFileName.DataLength = strlen(FileNameTemp);
 									strcpy(SendFileName.DataBuf,FileNameTemp);
-									FTP_SENDFILE_QueuePush(&gFtpSendFileServer.SendFileQueue,&SendFileName);
-									JSYA_Printf("主工作线程将文件名称(%s)压入缓冲队列\n\r",SendFileName.DataBuf);
+									DPrintf("主工作线程 准备插入队列\r\n");
+									if(FALSE == FTP_SENDFILE_QueuePush(gFtpSendFileServer.pQueue,&SendFileName)){
+										DPrintf("主工作线程 插入队列失败pQueue=%p\r\n",gFtpSendFileServer.pQueue);
+									}else{
+										JSYA_Printf("主工作线程将文件名称(%s)压入缓冲队列Queue(%p):Head(%p)Tail(%p)\n\r",\
+											SendFileName.DataBuf,gFtpSendFileServer.pQueue,gFtpSendFileServer.pQueue->Head,gFtpSendFileServer.pQueue->Tail);
+									}
 								}
 							}
 							
@@ -763,58 +978,66 @@ static void *MainWorkProcess(void *pArg)
 			}
 
 			//检查FTP工作线程是否被阻塞
-			if((time(NULL)-gFtpSendFileServer.FTPWorkThreadLastRunTime)>FTP_SENDFILE_SYSTEM_CALLER_TIMEOUT)
+			/*if((time(NULL)-gFtpSendFileServer.FTPWorkThreadLastRunTime)>FTP_SENDFILE_SYSTEM_CALLER_TIMEOUT)
 			{
 				JSYA_Printf("主工作线程发现FTP上传文件工作线程被阻塞,即将关闭busybox ftpput:killall -s 9 -w busybox\n\r");
 				system("killall -s 9 -w busybox");//杀死busybox同名进程,-s 发送信号9(SIGKILL)而不是SIGTERM,-w 等待被杀的进程结束
-			}
+			}*/
 			
 			gFtpSendFileServer.MainWorkThreadRunCount++;
 			usleep(FTP_SENDFILE_WORKTHREAD_TIME_SLICE_US);
 		}
 		usleep(FTP_SENDFILE_WORKTHREAD_TIME_SLICE_US);	
 	}
+	gFtpSendFileServer.IsMainWorkThreadQuit = TRUE;
+	DPrintf("gFtpSendFileServer.IsMainWorkThreadQuit is TRUE\n");
 	return NULL;		
 }
 static void *FtpWorkProcess(void *pArg)
 {
 
 	FTP_SENDFILE_QUEUE_DATA QueueData;
-	U32	CurrentTime;
+	
 	FTP_SENDFILE_SQLITE_MSG Msg;
-	U8	CmdBuf[1024]={0};
 	int OldStatus;
 	
 	JSYA_Printf("FTP发送文件工作线程(PID=%d 线程号:%u)开始启动...\r\n",getpid(),pthread_self());
 	for(; ;)
 	{
-		if (gFtpSendFileServer.IsFTPWorkThreadReqQuit)
+		gFtpSendFileServer.IsFTPWorkThreadQuit = FALSE;
+		if (gFtpSendFileServer.IsFTPWorkThreadReqQuit==TRUE)
 		{
+			DPrintf("gFtpSendFileServer.IsFTPWorkThreadReqQuit is TRUE\n");
 			gFtpSendFileServer.IsFTPWorkThreadReqQuit		= FALSE;
+			DPrintf("gFtpSendFileServer.IsFTPWorkThreadReqQuit is TRUE,Then set false\n");
 			break;
 		}
 		pthread_testcancel();
-		
 
-		//是否连接远程服务器
-		GET_CURRENT_SYS_TIME(CurrentTime);
-	
 		for (; ;)
 		{
-			if(gFtpSendFileServer.IsFTPWorkThreadReqQuit)
+			gFtpSendFileServer.IsFTPWorkThreadQuit = FALSE;
+			
+			if(gFtpSendFileServer.IsFTPWorkThreadReqQuit==TRUE){
+				DPrintf("gFtpSendFileServer.IsFTPWorkThreadReqQuit is TRUE\n");
 				break;
+			}
+				
 			pthread_testcancel();
 			gFtpSendFileServer.FTPWorkThreadLastRunTime = time(NULL);
-			GET_CURRENT_SYS_TIME(CurrentTime);
+			
 			if((gFtpSendFileServer.FTPWorkThreadRunCount%1000)==0)
-				JSYA_Printf("FTP发送文件工作线程(PID=%d 线程号:%u RunCount:%u)正在运行...\r\n",\
-					getpid(),pthread_self(),gFtpSendFileServer.FTPWorkThreadRunCount);
-			if((FALSE == FTP_SENDFILE_QueueGetHead(&gFtpSendFileServer.SendFileQueue))
+				JSYA_Printf("FTP发送文件工作线程(PID=%d 线程号:%u RunCount:%u)正在运行...\r\n",getpid(),pthread_self(),gFtpSendFileServer.FTPWorkThreadRunCount);
+
+			if((TRUE == FTP_SENDFILE_QueueGetHead(gFtpSendFileServer.pQueue))
 				&&(gFtpSendFileServer.FtpConfig.UploadedCnt<gFtpSendFileServer.FtpConfig.MaxRecordPerMonth))//队列非空
 			{
-				//JSYA_Printf("FTP发送文件工作线程发现当前有文件需要上传\r\n");
+				JSYA_Printf("FTP发送文件工作线程发现当前有文件需要上传\r\n");
 				memset(&QueueData,'\0',sizeof(FTP_SENDFILE_QUEUE_DATA));
-				FTP_SENDFILE_QueuePop(&gFtpSendFileServer.SendFileQueue,&QueueData);
+				if(FALSE == FTP_SENDFILE_QueuePop(gFtpSendFileServer.pQueue,&QueueData)){
+					DPrintf("FTP发送文件工作线程 FTP_SENDFILE_QueuePop false...\r\n");
+					continue;
+				}
 				/*************************   ftpput [OPTIONS] HOST [REMOTE_FILE] LOCAL_FILE   *********/
 				if(access(QueueData.DataBuf,0)!=-1)
 				{
@@ -823,7 +1046,7 @@ static void *FtpWorkProcess(void *pArg)
 					if(FALSE == FTP_SENDFILE_RecordMsg_Make(&Msg,QueueData.DataBuf))
 						continue; 
 					PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
-					if(FTP_SENDFILE_Select_FileName(&Msg)
+					if(FTP_SENDFILE_Select_FileName(FTP_SENDFILE_DB_PATH,&Msg)
 						&&(Msg.Ret == RET_ENUM_SUCCESS))//检查该文件是否上传成功(比对数据库)
 					{
 						JSYA_Printf("FTP发送文件工作线程读取数据库发现文件(%s)已经上传成功\n\r",Msg.FileName);
@@ -837,8 +1060,13 @@ static void *FtpWorkProcess(void *pArg)
 					PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);
 					if(FALSE == FTP_SENDFILE_SendByFtp(QueueData.DataBuf,&gFtpSendFileServer.FtpSendFileAck))
 					{
-						JSYA_Printf("FTP发送文件工作线程通过FTP上传文件(%s)失败:%s\r\n",QueueData.DataBuf,\
-							strerror(gFtpSendFileServer.FtpSendFileAck.m_RetCode));
+						gFtpSendFileServer.FTPSendFailCnt++;
+						gFtpSendFileServer.FTPSendFailCntContinuous++;
+						JSYA_Printf("FTP发送文件工作线程通过FTP上传文件(%s)失败(FailCnt:%u,FailCntContinuous:%u):%s\r\n",QueueData.DataBuf,\
+							gFtpSendFileServer.FTPSendFailCnt,gFtpSendFileServer.FTPSendFailCntContinuous,strerror(gFtpSendFileServer.FtpSendFileAck.m_RetCode));
+						if(TRUE == FTP_SENDFILE_QueuePush(gFtpSendFileServer.pQueue,&QueueData)){
+							JSYA_Printf("FTP发送文件工作线程重新将记录插入到队列中\r\n");
+						}
 					}
 					else
 					{
@@ -847,7 +1075,7 @@ static void *FtpWorkProcess(void *pArg)
 						if(TRUE == FTP_SENDFILE_RecordMsg_Make(&Msg,QueueData.DataBuf))
 						{
 							PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
-							if(FTP_SENDFILE_Insert_FileName(&Msg))
+							if(FTP_SENDFILE_Insert_FileName(FTP_SENDFILE_DB_PATH,&Msg))
 								JSYA_Printf("FTP发送文件工作线程将(FileName:%s,SendTime:%s)插入数据库成功\r\n",Msg.FileName,Msg.SendTime);
 							else
 								JSYA_Printf("FTP发送文件工作线程将(FileName:%s,SendTime:%s)插入数据库失败\r\n",Msg.FileName,Msg.SendTime);
@@ -855,12 +1083,15 @@ static void *FtpWorkProcess(void *pArg)
 							
 						}
 						gFtpSendFileServer.FtpConfig.UploadedCnt++;	
+						gFtpSendFileServer.FTPSendFailCntContinuous = 0;
 					}
 				}
 				else
 				{
 					JSYA_Printf("FTP发送文件工作线程发现文件(%s)不存在\n\r",QueueData.DataBuf);
 				}
+				
+			}else{
 				
 			}
 				
@@ -870,6 +1101,8 @@ static void *FtpWorkProcess(void *pArg)
 		}
 		usleep(FTP_SENDFILE_WORKTHREAD_TIME_SLICE_US);
 	}
+	gFtpSendFileServer.IsFTPWorkThreadQuit = TRUE;
+	DPrintf("gFtpSendFileServer.IsFTPWorkThreadQuit is TRUE\n");
 	return NULL;
 }
 extern U32 FtpSendFile_Open(PFTP_SENDFILE_CONFIG pConfig)
@@ -894,45 +1127,73 @@ extern U32 FtpSendFile_Open(PFTP_SENDFILE_CONFIG pConfig)
 			gFtpSendFileServer.FtpConfig.UserName,gFtpSendFileServer.FtpConfig.WorkDirectory,\
 			gFtpSendFileServer.FtpConfig.Port);
 	}
-	if((pthread_create(&gFtpSendFileServer.MainWorkThreadPID,NULL,MainWorkProcess,NULL)==STD_SUCCESS)
-		&&(pthread_create(&gFtpSendFileServer.FTPWorkThreadPID,NULL,FtpWorkProcess,NULL)==STD_SUCCESS))
-	{
+	
+	FTP_SENDFILE_QueueListInit(&gFtpSendFileServer.pQueue);
+	DPrintf(" FTP_SENDFILE_QueueListInit(pQueue=%p)\n",gFtpSendFileServer.pQueue);
+	
+	gFtpSendFileServer.IsMainWorkThreadQuit = TRUE;
+	gFtpSendFileServer.IsFTPWorkThreadQuit = TRUE;
+	JSYA_Printf("准备创建模块工作线程(MainWorkThreadPID=0x%x)...\r\n",gFtpSendFileServer.MainWorkThreadPID);
+	if(pthread_create(&gFtpSendFileServer.MainWorkThreadPID,NULL,MainWorkProcess,NULL)==0){
 		gFtpSendFileServer.IsMainWorkThreadReqQuit = FALSE;
-		gFtpSendFileServer.IsFTPWorkThreadReqQuit = FALSE;
-		gFtpSendFileServer.IsOpen = TRUE;
-		JSYA_Printf("模块工作线程已经创建(MainWorkThreadPID=%u,FTPWorkThreadPID=%u)...\r\n",\
-			gFtpSendFileServer.MainWorkThreadPID,gFtpSendFileServer.FTPWorkThreadPID);
-		return TRUE;
-	}
-	else
-	{
+		JSYA_Printf("创建模块工作线程成功(MainWorkThreadPID=0x%x)...\r\n",gFtpSendFileServer.MainWorkThreadPID);
+		JSYA_Printf("准备创建模块工作线程(FTPWorkThreadPID=0x%x)...\r\n",gFtpSendFileServer.FTPWorkThreadPID);
+		if(pthread_create(&gFtpSendFileServer.FTPWorkThreadPID,NULL,FtpWorkProcess,NULL)==0){
+			gFtpSendFileServer.IsFTPWorkThreadReqQuit = FALSE;
+			JSYA_Printf("创建模块工作线程成功(FTPWorkThreadPID=0x%x)...\r\n",gFtpSendFileServer.FTPWorkThreadPID);
+			gFtpSendFileServer.IsOpen = TRUE;
+			return TRUE;
+		}else{
+			pthread_cancel(gFtpSendFileServer.FTPWorkThreadPID);
+			pthread_join(gFtpSendFileServer.FTPWorkThreadPID,NULL);
+		}
+	}else{
 		pthread_cancel(gFtpSendFileServer.MainWorkThreadPID);
 		pthread_join(gFtpSendFileServer.MainWorkThreadPID,NULL);
-		pthread_cancel(gFtpSendFileServer.FTPWorkThreadPID);
-		pthread_join(gFtpSendFileServer.FTPWorkThreadPID,NULL);
+	}	
 		
 OpenFail:
-		JSYA_Printf("模块工作线程创建失败(%s)...\r\n",strerror(errno));
-		gFtpSendFileServer.IsOpen = FALSE;
-		return FALSE;
-	}
+	JSYA_Printf("模块工作线程创建失败(%s)...\r\n",strerror(errno));
+	gFtpSendFileServer.IsOpen = FALSE;
+	return FALSE;
 }
-extern void FtpSendFile_Close()
+
+extern void FtpSendFile_Close(void)
 {
 	if(gFtpSendFileServer.IsOpen)
 	{
-		gFtpSendFileServer.IsMainWorkThreadReqQuit = TRUE;
-		usleep(2*PTHREAD_DEFAULT_QUIT_TIMEOUT_US);
-		pthread_cancel(gFtpSendFileServer.MainWorkThreadPID);
-		pthread_join(gFtpSendFileServer.MainWorkThreadPID,NULL);
-		JSYA_Printf("等待主工作线程退出完成...\r\n");
-		gFtpSendFileServer.IsFTPWorkThreadReqQuit = TRUE;
-		usleep(2*PTHREAD_DEFAULT_QUIT_TIMEOUT_US);
-		pthread_cancel(gFtpSendFileServer.FTPWorkThreadPID);
+		if(gFtpSendFileServer.FTPWorkThreadPID!=INVALID_PTHREAD_ID)
+			gFtpSendFileServer.IsFTPWorkThreadReqQuit = TRUE;
+
+		usleep(PTHREAD_DEFAULT_QUIT_TIMEOUT_US);
+		if((gFtpSendFileServer.FTPWorkThreadPID!=INVALID_PTHREAD_ID)
+			&&(gFtpSendFileServer.IsFTPWorkThreadReqQuit == TRUE)){
+			DPrintf("Send cancel To FTPWorkThreadPID\n");
+			pthread_cancel(gFtpSendFileServer.FTPWorkThreadPID);
+		}
+		
+		DPrintf("等待FTP发送文件工作线程退出...\r\n");
 		pthread_join(gFtpSendFileServer.FTPWorkThreadPID,NULL);
+		JSYA_Printf("等待FTP发送文件工作线程退出完成!...\r\n");
+		
+		if(gFtpSendFileServer.MainWorkThreadPID!=INVALID_PTHREAD_ID)
+			gFtpSendFileServer.IsMainWorkThreadReqQuit = TRUE;
+		
+		usleep(PTHREAD_DEFAULT_QUIT_TIMEOUT_US);
+		if((gFtpSendFileServer.MainWorkThreadPID!=INVALID_PTHREAD_ID)
+			&&(gFtpSendFileServer.IsMainWorkThreadReqQuit == TRUE)){
+			DPrintf("Send cancel To MainWorkThreadPID\n");
+			pthread_cancel(gFtpSendFileServer.MainWorkThreadPID);
+		}
+		
+		DPrintf("等待主工作线程退出...\r\n");
+		pthread_join(gFtpSendFileServer.MainWorkThreadPID,NULL);
+		JSYA_Printf("等待主工作线程退出完成!...\r\n");
+		
 		memset(&gFtpSendFileServer,0,sizeof(FTP_SENDFILE_SERVER));
-		JSYA_Printf("等待FTP发送文件工作线程退出完成...\r\n");
+		
 	}
+	FTP_SENDFILE_QueueListDeInit(&gFtpSendFileServer.pQueue);
 }
 static void print_usage(void)
 {
@@ -951,7 +1212,7 @@ static void print_usage(void)
 
 static int config_load(int argc,char **argv,PFTP_SENDFILE_CONFIG pConfig)
 {
-	int i,ch,rc=0;
+	int i,ch,rc=0,OldStatus;
 	FTP_SENDFILE_CONFIG TempConfig;
 		
 	if(pConfig==NULL)
@@ -1025,8 +1286,9 @@ static int config_load(int argc,char **argv,PFTP_SENDFILE_CONFIG pConfig)
 				break;
 		}
 	}
-	
-	FTP_SENDFILE_GetParamFromDB(&TempConfig);
+	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
+	FTP_SENDFILE_GetParamFromDB(FTP_SENDFILE_DB_PATH,&TempConfig);
+	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);
 	DPrintf("FTP_SENDFILE_GetParamFromDB UserName=\"%s\",PassWord=\"%s\",FtpServerIP=\"%s\",Port=%d,WorkDir=\"%s\",MaxRecordPermonth=%u,UploadedCnt=%u\r\n",\
 				TempConfig.UserName,TempConfig.PassWord,TempConfig.FtpServerIP,TempConfig.Port,\
 				TempConfig.WorkDirectory,TempConfig.MaxRecordPerMonth,TempConfig.UploadedCnt);
@@ -1040,15 +1302,88 @@ static int config_load(int argc,char **argv,PFTP_SENDFILE_CONFIG pConfig)
 				pConfig->WorkDirectory,pConfig->MaxRecordPerMonth,pConfig->UploadedCnt);
 	return rc;
 }
+
+static void signal_handler(int SigNo){
+	JSYA_Printf("##########   catch  signal %d\n",SigNo);
+
+	FtpSendFile_Close();
+	signal(SigNo,SIG_DFL);
+	raise(SigNo);
+}
+
+static void signal_nohandler(int SigNo){
+	JSYA_Printf("##########   catch  signal %d\n",SigNo);
+	signal(SigNo,SIG_DFL);
+	raise(SigNo);
+}
+
+static void SysSignalProcessorInstall(void)
+{
+	signal(SIGBUS,signal_nohandler);
+	signal(SIGSEGV,signal_handler);
+	signal(SIGILL,signal_nohandler);
+	signal(SIGFPE,signal_nohandler);
+	signal(SIGTRAP,signal_nohandler);
+	signal(SIGSYS,signal_nohandler);
+	signal(SIGSTKFLT,signal_nohandler);
+	signal(SIGABRT,signal_nohandler);
+
+	signal(SIGPWR,signal_nohandler);
+	signal(SIGTTIN,signal_nohandler);
+	signal(SIGTTOU,signal_nohandler);
+	signal(SIGXCPU,signal_nohandler);
+	signal(SIGXFSZ,signal_nohandler);
+	signal(SIGUSR1,signal_nohandler);
+	signal(SIGUSR2,signal_nohandler);
+
+	signal(SIGTERM,signal_handler);
+	signal(SIGINT,signal_handler);
+	signal(SIGQUIT,signal_handler);
+	signal(SIGHUP,signal_nohandler);
+
+	signal(SIGPIPE,signal_nohandler);
+	signal(SIGIO,signal_nohandler);
+	signal(SIGTSTP,signal_nohandler);
+	signal(SIGALRM,signal_nohandler);
+	signal(SIGVTALRM,signal_nohandler);
+	signal(SIGPROF,signal_nohandler);
+}
+static int InitFtpSentFileDB(char *pDir)
+{
+	FILE *fp=NULL;
+	int rc=0;
+	
+	assert(pDir!=NULL);
+
+	if(access(pDir,0)==-1){
+		DPrintf("Find %s unaccess,then creat it!\n",pDir);
+		fp = fopen(pDir,"wb+");
+		if(fp==NULL){
+			rc = -1;
+			return rc;
+		}
+		fclose(fp);
+		FTP_SENDFILE_CreatConfigTable(pDir);
+		FTP_SENDFILE_CreatSentFileTable(pDir);
+	}
+	return rc;
+}
+
 extern int main(int argc,char **argv)
 {
-	int rc;
+	int rc,OldStatus;
 	U32 LastUploadedCnt=0;
 	U32 IsClearCnt=0;
 	time_t  stime;
 	struct tm nowTime;
 	PFTP_SENDFILE_CONFIG pConfig=NULL; 
-
+	
+	SysSignalProcessorInstall();
+	
+	PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
+	InitFtpSentFileDB(FTP_SENDFILE_DB_PATH);
+	PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);
+	
 	pConfig = (PFTP_SENDFILE_CONFIG)malloc(sizeof(FTP_SENDFILE_CONFIG));
 	if(pConfig!=NULL){
 		rc = config_load(argc,argv,pConfig);
@@ -1058,22 +1393,29 @@ extern int main(int argc,char **argv)
 				pConfig->UserName,pConfig->PassWord,pConfig->FtpServerIP,pConfig->Port,\
 				pConfig->WorkDirectory,pConfig->MaxRecordPerMonth,pConfig->UploadedCnt);
 			FtpSendFile_Open(pConfig);
+			PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
+			FTP_SENDFILE_SetParamToDB(FTP_SENDFILE_DB_PATH,pConfig);
+			PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);
 			free(pConfig);
 		}else{
 			print_usage();
+			
 			return 1;
 		}
 	}else{
 		fprintf(stderr,"%s\n",strerror(errno));
 	}
+	
 	while(1){
 		if(LastUploadedCnt!=gFtpSendFileServer.FtpConfig.UploadedCnt){
-			if(TRUE==FTP_SENDFILE_SaveUploadedCnt(gFtpSendFileServer.FtpConfig.UploadedCnt)){
+			PTHREAD_MUTEX_SAFE_LOCK(FtpSendFileSQLiteMutex,OldStatus);
+			if(TRUE==FTP_SENDFILE_SaveUploadedCnt(&gFtpSendFileServer.FtpConfig.UploadedCnt)){
 				LastUploadedCnt=gFtpSendFileServer.FtpConfig.UploadedCnt; 
 				DPrintf("Main SaveUploadedCnt Succ:%u\n",LastUploadedCnt);
 			}
-				
+			PTHREAD_MUTEX_SAFE_UNLOCK(FtpSendFileSQLiteMutex,OldStatus);	
 		}
+		//判断是否是月初，若是，则保存计数清零
 	 	stime = time(NULL);
 	 	localtime_r(&stime, &nowTime);
 		if((nowTime.tm_mday==1)&&(nowTime.tm_hour==0)
@@ -1083,6 +1425,14 @@ extern int main(int argc,char **argv)
 			DPrintf("Main IsClearCnt = 1\n");
 		}else if(nowTime.tm_min!=0){
 			IsClearCnt = 0;
+		}
+
+		//检查FTP工作线程是否被阻塞
+		if(((time(NULL)-gFtpSendFileServer.FTPWorkThreadLastRunTime)>FTP_SENDFILE_SYSTEM_CALLER_TIMEOUT)
+			&&(gFtpSendFileServer.IsFTPWorkThreadQuit==FALSE))
+		{
+			JSYA_Printf("主工作线程发现FTP上传文件工作线程被阻塞,即将关闭busybox ftpput:killall -s 9 -w busybox\n\r");
+			system("killall -s 9 -w busybox");//杀死busybox同名进程,-s 发送信号9(SIGKILL)而不是SIGTERM,-w 等待被杀的进程结束
 		}
 		sleep(1);
 	}
