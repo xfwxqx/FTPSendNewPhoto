@@ -59,17 +59,26 @@
 #define FTP_SENDFILE_MAX_UPLOAD_FILES		0
 
 
-#define FTP_SENDFILE_WORK_DIR_DEFAULT		"/dvs/srv/ftp/PIC"
+
 #define FTP_SENDFILE_FILE_MODIFY_TIME_MAX_S	10
 #define FTP_SENDFILE_QUEUE_DATABUF_MAX		150
-#define FTP_SENDFILE_LOG_FILE		"/tmp/log.txt"
+
 #define FTP_SENDFILE_SYSTEM_CALLER_TIMEOUT			30
 
-#define FTP_SENDFILE_DB_PATH	"/dvs/srv/config/ftpsendfile.db"
+
 #define FTP_SENDFILE_DB_BUSY_TIMEOUT_MS				3000
 
-
-
+#if defined(PLATFORM_OF_NUC972)
+	#define FTP_SENDFILE_WORK_DIR_DEFAULT		"/dvs/srv/ftp/PIC/PIC"
+	#define FTP_SENDFILE_LOG_FILE		"/tmp/log.txt"
+	#define FTP_SENDFILE_DB_PATH	"/dvs/srv/config/ftpsendfile.db"
+#elif defined(PLATFORM_OF_RASPBERRYPI)
+	#define FTP_SENDFILE_WORK_DIR_DEFAULT		"/srv/ftp/PIC/PIC"
+	#define FTP_SENDFILE_LOG_FILE		"/tmp/log.txt"
+	#define FTP_SENDFILE_DB_PATH	"/data/ftpsendfile.db"
+#else
+	#error "Must Define PLATFORM Type!"
+#endif
 
 
 #ifdef DEBUG
